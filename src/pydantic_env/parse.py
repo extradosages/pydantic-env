@@ -1,16 +1,16 @@
-from typing import Any, Dict, List, Type, Union
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel
-
-
-Schema = Type[BaseModel]
 
 
 def _is_schema(obj: Any):
     """
     Check is an arbitrary object is a pydantic model/config (sub)schema.
     """
-    return issubclass(obj, BaseModel)
+    try:
+        return issubclass(obj, BaseModel)
+    except TypeError:
+        return False
 
 
 def _path_to_var_name(path: List[str]):
@@ -38,18 +38,29 @@ def _strip_var_prefix(prefix: str, prefixed_key: str):
     return prefixed_key[len(normalized_prefix) :]
 
 
-def _preprocess_var_dict(prefix: str, var_dict: Dict[str, str]):
+def _preprocess_var_dict(prefix: Optional[str], var_dict: Dict[str, Optional[str]]):
     """
     Pre-process a dictionary of variables
     """
-    normalized_prefix = _normalize_var_prefix(prefix)
-    # Remove anything not prefixed by the prefix
-    prefixed = {k: v for k, v in var_dict.items() if k.startswith(normalized_prefix)}
-    # Strip the prefix away
-    return {_strip_var_prefix(prefix, k): v for k, v in prefixed.items()}
+    non_empty = {k: v for k, v in var_dict.items() if v is not None}
+
+    preprocessed = non_empty
+    if prefix is not None:
+        normalized_prefix = _normalize_var_prefix(prefix)
+        # Remove anything not prefixed by the prefix
+        prefixed = {
+            k: v for k, v in non_empty.items() if k.startswith(normalized_prefix)
+        }
+        # Strip the prefix away
+        preprocessed = {_strip_var_prefix(prefix, k): v for k, v in prefixed.items()}
+
+    return preprocessed
 
 
-class ConfigParser:
+T = TypeVar("T", bound=BaseModel)
+
+
+class ConfigParser(Generic[T]):
     """
     ConfigParser for parsing configuration from a dictionary of environment variables.
 
@@ -64,17 +75,31 @@ class ConfigParser:
     from pydantic import BaseModel
 
     class DatabaseConfig(BaseModel):
-        host: str
         port: int
+
+        # Aliased fields will be derived from var dict variables according to their alias
+        # but they will be accessible in-memory with the actual field name
+        address: str = Field(alias='host')
 
     class AppConfig(BaseModel):
         debug: bool
+
+        # Config can be nested
         database: DatabaseConfig
 
+        # Unions do not work yet
+        # deployment: Union[Literal['dev'], Literal['prod']]
+
+    # Config parsers can specify a prefix to expect from environment variables
     config_parser = ConfigParser(AppConfig, "MYAPP")
+
+    # Config can be parsed from any dictionary source, such as:
+    # - the environment
+    # - dotenv files
     validated_config = config_parser.parse({
         **os.environ
     })
+
     print(validated_config)
     # If the environment consisted of:
     # MYAPP_DEBUG=True
@@ -89,25 +114,36 @@ class ConfigParser:
     ```
     """
 
-    schema: Schema
-    var_prefix: Union[str, None]
+    schema: Type[T]
+    """
+    """
 
-    def __init__(self, schema: Schema, var_prefix: Union[str, None]):
+    var_prefix: Optional[str]
+    """
+    """
+
+    def __init__(self, schema: Type[T], var_prefix: Optional[str]):
         self.schema = schema
-        self.var_prefix
+        self.var_prefix = var_prefix
 
-    def _paths(self, path_prefix: List[str] = []):
+    def _paths(
+        self, sub_schema: Optional[Type[BaseModel]], path_prefix: List[str] = []
+    ):
         """
         Obtain all path strings for a config schema.
         """
+        if sub_schema is None:
+            sub_schema = self.schema
+
         paths: List[List[str]] = []
-        for key, value in self.schema.model_fields.items():
+        for key, value in sub_schema.model_fields.items():
+            # Check to see if this is an aliased field and update it if so
+            if value.alias is not None:
+                key = value.alias
             prefixed_key = path_prefix + [key]
             annotation = value.annotation
             if _is_schema(annotation):
-                # Type is an issue here if not working with a PEP-0647-compliant version
-                # of python
-                paths.extend(self._paths(annotation, prefixed_key))  # type: ignore
+                paths.extend(self._paths(annotation, prefixed_key))
             else:
                 paths.append(prefixed_key)
 
@@ -116,13 +152,6 @@ class ConfigParser:
     def var_name_to_path_table(self):
         """
         Create a map between environment variable names and schema paths.
-
-        Raises:
-        - RuntimeError: If there's ambiguity in resolving schema paths to environment
-            variables.
-
-        Returns:
-        - Dict[str, List[str]]: Mapping between variable names and schema paths.
 
         Example:
         ```
@@ -147,7 +176,7 @@ class ConfigParser:
         # }
         ```
         """
-        paths = self._paths()
+        paths = self._paths(None)
 
         pairs = [(_path_to_var_name(path), path) for path in paths]
         var_names = [var_name for var_name, _ in pairs]
@@ -189,6 +218,12 @@ class ConfigParser:
         root: Dict[str, Any] = {}
 
         for var_name, value in var_dict.items():
+            if var_name not in path_lookup:
+                message = f"""Extra var `{var_name}` found in var dict; expected one of
+                {list(path_lookup.keys())}
+                """
+                raise RuntimeError(message)
+
             path = path_lookup[var_name]
             path_length = len(path)
 
@@ -203,12 +238,12 @@ class ConfigParser:
 
         return root
 
-    def parse(self, var_dict: Dict[str, str]):
+    def parse(self, var_dict: Dict[str, Optional[str]]) -> T:
         """
         Parse and validate configuration from a dictionary of environment variables.
 
         Args:
-        - var_dict (Dict[str, str]): Dictionary of environment variables.
+        - var_dict (Dict[str, Optional[str]]): Dictionary of environment variables.
 
         Returns:
         - Any: Validated configuration.
@@ -283,95 +318,16 @@ class ConfigParser:
         # )
         ```
         """
-        # If `self.var_prefix is None` then preprocessing should be a no-op
-        preprocessed = var_dict
-        if self.var_prefix is not None:
-            # Otherwise we ought to account for the prefix in our env dict
-            preprocessed = _preprocess_var_dict(self.var_prefix, var_dict)
+        preprocessed = _preprocess_var_dict(self.var_prefix, var_dict)
         proto_config = self._var_dict_to_proto_config(preprocessed)
         return self.schema.model_validate(proto_config)
 
 
-def parse(schema: Schema, var_prefix: Union[str, None], var_dict: Dict[str, str]):
+def parse(
+    schema: Type[T], var_prefix: Optional[str], var_dict: Dict[str, Optional[str]]
+) -> T:
     """
     Utility function to parse and validate configuration from environment variables.
-
-    Args:
-    - schema (Schema): The Pydantic model/schema for validation.
-    - var_prefix (Union[str, None]): Prefix to filter environment variables.
-    - var_dict (Dict[str, str]): Dictionary of environment variables, viz. `os.environ`
-        or `dotenv.dotenv_values(".env")`.
-
-    Returns:
-    - Any: Validated configuration.
-
-    Example, building a schema:
-    ```
-    from pydantic import BaseModel, SecretStr
-
-    class Database(BaseModel):
-        host: str
-        port: int
-        password: SecretStr
-
-    class Config(BaseModel):
-        debug: bool
-        database: Database
-    ```
-
-    Example, parsing prefixed environment variables:
-    ```
-    from pydantic_env import parse
-
-    from .schema import Config
-
-
-    # Parse a var dict with prefixed var names
-    config = parse(Config, "MYAPP", {
-        'MYAPP_DEBUG': 'True',
-        'MYAPP_DATABASE_HOST': 'localhost',
-        'MYAPP_DATABASE_PORT': '5432',
-        'MYAPP_DATABASE_PASSWORD': 'password123'
-    })
-
-    print(config)
-    # Output:
-    # Config(
-    #    debug=True,
-    #    database=Database(
-    #        host='localhost',
-    #        port=5432,
-    #        password=SecretStr('**********')
-    #    )
-    # )
-    ```
-
-    Example, parsing unprefixed environment variables:
-    ```
-    from pydantic_env import parse
-
-    from .schema import Config
-
-
-    # Parsing unprefixed environment variables
-    config = parse(Config, None, {
-        'DEBUG': 'True',
-        'DATABASE_HOST': 'localhost',
-        'DATABASE_PORT': '5432',
-        'DATABASE_PASSWORD': 'password123'
-    })
-
-    print(config)
-    # Output:
-    # Config(
-    #    debug=True,
-    #    database=Database(
-    #        host='localhost',
-    #        port=5432,
-    #        password=SecretStr('**********')
-    #    )
-    # )
-    ```
     """
     parser = ConfigParser(schema, var_prefix)
     return parser.parse(var_dict)

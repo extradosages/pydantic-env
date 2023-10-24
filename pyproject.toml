@@ -1,6 +1,6 @@
 [project]
 name = "pydantic-env"
-version = "0.1.0"
+version = "0.2.0"
 description = "Validate and structure env variables with pydantic."
 authors = [
     {name = "extradosages", email = "extradosages.001@gmail.com"},
@@ -20,4 +20,5 @@ build-backend = "pdm.backend"
 dev = [
     "black>=23.9.1",
     "ruff>=0.0.289",
+    "pytest>=7.4.2",
 ]

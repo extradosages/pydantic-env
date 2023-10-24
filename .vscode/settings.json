@@ -1,5 +1,7 @@
 {
     "cSpell.words": [
         "pydantic"
-    ]
+    ],
+    "editor.formatOnSave": true,
+    "python.analysis.typeCheckingMode": "strict",
 }
