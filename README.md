@@ -202,3 +202,8 @@ def test_config():
 
     assert actual_config == expected_config
 ```
+
+## Alternatives
+
+- [typed-config](https://github.com/bwindsor/typed-config)
+- [pydantic-config](https://github.com/jordantshaw/pydantic-config)
